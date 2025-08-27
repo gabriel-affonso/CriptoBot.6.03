@@ -119,7 +119,7 @@ def setup_logging():
 def register_trade(tipo, symbol, qty, price, reason):
     header = ['timestamp','type','symbol','qty','price','reason']
     newrow = [
-        datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+        datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         tipo, symbol, f"{qty:.6f}", f"{price:.4f}", reason
     ]
     write_header = not os.path.exists(LOG_FILE)
@@ -144,7 +144,8 @@ def log_skip(layer: str, symbol: str, info: str = ""):
     logging.info(msg)
     send_telegram(msg)
     header = ['timestamp', 'layer', 'symbol', 'info']
-    newrow = [datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), layer, symbol, info]
+    newrow = [datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), layer, symbol, info]
+
     write_header = not os.path.exists(SKIP_LOG_FILE)
     with open(SKIP_LOG_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
@@ -459,8 +460,9 @@ def build_rf_features_15m(symbol: str) -> pd.DataFrame:
 
         if RF_SAVE_FEATURES:
             os.makedirs(RF_FEATURE_SAVE_DIR, exist_ok=True)
-            ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
             feat.to_csv(os.path.join(RF_FEATURE_SAVE_DIR, f"{symbol}_{ts}.csv"), index=False)
+
 
         return feat
     except Exception as e:
@@ -962,7 +964,7 @@ def sync_positions_with_binance():
                         "risk":        None,
                         "partial_taken": False
                     }
-                    position_times[symbol] = datetime.utcnow()
+                    position_times[symbol] = datetime.now(timezone.utc)
                     logging.info(f"[SYNC POSITION] {symbol} imported with qty={qty:.6f} @ {entry_price:.4f}")
                     save_state()
             else:
@@ -1062,9 +1064,9 @@ def main_loop():
                             logging.info(f"[{symbol}] SKIP ENTRY: cost {cost:.2f} < minimum {min_trade:.2f}")
                             continue
 
-                        # Efetivar ordem de compra
+                              # Efetivar ordem de compra
                         try:
-                            order = client.order_market_buy(symbol=symbol, quoteOrderQty=round(cost,2))
+                            order = client.order_market_buy(symbol=symbol, quoteOrderQty=round(cost, 2))
                             fills = order.get('fills', [])
                             qty_filled = sum(float(fill["qty"]) for fill in fills)
                             if qty_filled <= 0:
@@ -1086,7 +1088,7 @@ def main_loop():
                                 "risk": trade_risk,
                                 "partial_taken": False
                             }
-                            position_times[symbol] = datetime.utcnow()
+                            position_times[symbol] = datetime.now(timezone.utc)
                             register_trade("BUY", symbol, qty_filled, avg_price, "MATH+IA_REG+CLF+RF(2)")
                             send_telegram(f"🟢 BUY {symbol} qty={qty_filled:.6f} @ {avg_price:.4f}")
                             save_state()
@@ -1106,6 +1108,11 @@ def main_loop():
                         entry_price = Decimal(str(pos['entry_price']))
                         qty         = Decimal(str(pos['quantity']))
                         side        = pos.get('side','long')
+                        try:
+                            price = float(client.get_symbol_ticker(symbol=symbol)["price"])
+                        except Exception as e:
+                            logging.error(f"[{symbol}] PRICE FETCH ERROR: {e}")
+                            continue
                         current_price = Decimal(str(price))
                         rules = get_symbol_rules(symbol)
 
