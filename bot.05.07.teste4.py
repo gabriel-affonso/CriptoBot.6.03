@@ -145,6 +145,7 @@ def log_skip(layer: str, symbol: str, info: str = ""):
     send_telegram(msg)
     header = ['timestamp', 'layer', 'symbol', 'info']
     newrow = [datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), layer, symbol, info]
+
     write_header = not os.path.exists(SKIP_LOG_FILE)
     with open(SKIP_LOG_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
@@ -461,6 +462,7 @@ def build_rf_features_15m(symbol: str) -> pd.DataFrame:
             os.makedirs(RF_FEATURE_SAVE_DIR, exist_ok=True)
             ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
             feat.to_csv(os.path.join(RF_FEATURE_SAVE_DIR, f"{symbol}_{ts}.csv"), index=False)
+
 
         return feat
     except Exception as e:
@@ -1062,9 +1064,9 @@ def main_loop():
                             logging.info(f"[{symbol}] SKIP ENTRY: cost {cost:.2f} < minimum {min_trade:.2f}")
                             continue
 
-                        # Efetivar ordem de compra
+                              # Efetivar ordem de compra
                         try:
-                            order = client.order_market_buy(symbol=symbol, quoteOrderQty=round(cost,2))
+                            order = client.order_market_buy(symbol=symbol, quoteOrderQty=round(cost, 2))
                             fills = order.get('fills', [])
                             qty_filled = sum(float(fill["qty"]) for fill in fills)
                             if qty_filled <= 0:
