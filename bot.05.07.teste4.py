@@ -40,7 +40,7 @@ from scipy.stats import pearsonr
 
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-import pickle
+import skops.io as sio
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
 
@@ -90,6 +90,18 @@ REG_MODEL_PATH = os.path.join(MODEL_DIR, 'xgb_reg.json')
 CLF_MODEL_PATH = os.path.join(MODEL_DIR, 'stacked_clf_v5.pkl')
 # SCALER_CLASSIFIER_PATH = os.path.join(MODEL_DIR, 'scaler_classifier.joblib')  # NEW: classifier scaler
 
+# Random Forest artifacts
+RF_ARTIFACTS_DIR = r"C:\Users\CES\Dropbox\Coisas\Coisas do PC\4\6.01"
+RF_SKOPS_PATH    = os.path.join(RF_ARTIFACTS_DIR, 'rf_model.skops')
+RF_FEATURES_PATH = os.path.join(RF_ARTIFACTS_DIR, 'rf_feature_columns.txt')
+
+# Thresholds
+CLF_THRESHOLD   = 0.69
+IA_REG_THRESHOLD = 0.01
+
+# Skip logging
+SKIP_LOG_FILE = 'bot_skip_log.csv'
+
 # ─── LOGGING SETUP ──────────────────────────────────────────────────────────────
 
 def setup_logging():
@@ -125,6 +137,20 @@ def send_telegram(msg):
         requests.get(url, params={'chat_id': TELEGRAM_CHAT_ID, 'text': msg}, timeout=5)
     except Exception:
         pass
+
+def log_skip(layer: str, symbol: str, info: str = ""):
+    """Register skip events to CSV and Telegram."""
+    msg = f"[SKIP][{layer}] {symbol} {info}".strip()
+    logging.info(msg)
+    send_telegram(msg)
+    header = ['timestamp', 'layer', 'symbol', 'info']
+    newrow = [datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), layer, symbol, info]
+    write_header = not os.path.exists(SKIP_LOG_FILE)
+    with open(SKIP_LOG_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(header)
+        writer.writerow(newrow)
 
 # --- FEATURE LIST LOADING AND SANITY CHECK ---
 FEATURE_COLUMNS_TXT = os.path.join(MODEL_DIR, 'feature_columns.txt')
@@ -372,134 +398,114 @@ stacked_clf: CalibratedClassifierCV = joblib.load(CLF_MODEL_PATH)
 
 logging.info("IA models loaded successfully.")
 
-# --- Random Forest model integration (from Documento de Gabriel Affonso (2).py) ---
-RF_MODEL_PATH = os.path.join(MODEL_DIR, 'rf_model.pkl')
-RF_FEATURES_PATH = os.path.join(MODEL_DIR, 'rf_feature_columns.txt')
+# --- Random Forest model (SKOPS) ---
 rf_model = None
-rf_feature_names = None
+rf_feature_columns: list[str] = []
 try:
-    if os.path.exists(RF_MODEL_PATH):
-        with open(RF_MODEL_PATH, 'rb') as f:
-            rf_model = pickle.load(f)
-        logging.info(f"[RF] Loaded Random Forest model from {RF_MODEL_PATH}")
+    if os.path.exists(RF_SKOPS_PATH):
+        rf_model = sio.load(RF_SKOPS_PATH)
+        logging.info(f"[RF] Loaded model from {RF_SKOPS_PATH}")
     else:
-        logging.warning(f"[RF] RF model file not found at {RF_MODEL_PATH}")
+        logging.warning(f"[RF] RF model not found at {RF_SKOPS_PATH}")
 except Exception as e:
     rf_model = None
-    logging.exception(f"[RF] Could not load rf_model.pkl: {e}")
+    logging.exception(f"[RF] Failed to load model: {e}")
 
-if os.path.exists(RF_FEATURES_PATH):
-    try:
+try:
+    if os.path.exists(RF_FEATURES_PATH):
         with open(RF_FEATURES_PATH) as f:
-            rf_feature_names = [line.strip() for line in f if line.strip()]
-        logging.info(f"[RF] Loaded RF feature list ({len(rf_feature_names)} features) from {RF_FEATURES_PATH}")
-    except Exception:
-        rf_feature_names = None
-
-def compute_15m_features_from_1m(symbol: str, limit_1m: int = 3000) -> pd.DataFrame:
-    """
-    Fetch 1m candles, resample to 15m and compute a compact set of features
-    compatible with the original RF training script.
-    Returns DataFrame with engineered features (one row per 15m bar).
-    """
-    df1m = fetch_klines_df(symbol, Client.KLINE_INTERVAL_1MINUTE, limit=limit_1m)
-    if df1m.shape[0] < 60:
-        return pd.DataFrame()
-    df1m = df1m[['open','high','low','close','volume']].sort_index()
-    df15 = df1m.resample('15min').agg({
-        'open':   'first',
-        'high':   'max',
-        'low':    'min',
-        'close':  'last',
-        'volume': 'sum'
-    }).dropna()
-
-    # Basic engineered features (subset from training script)
-    df15['return']       = df15['close'].pct_change()
-    df15['price_change'] = df15['close'] - df15['open']
-    df15['volatility']   = df15['return'].rolling(14).std()
-    df15['sma_20']       = df15['close'].rolling(20).mean()
-    df15['ema_50']       = df15['close'].ewm(span=50, adjust=False).mean()
-    df15['ema_9']        = df15['close'].ewm(span=9, adjust=False).mean()
-    df15['ema_200']      = df15['close'].ewm(span=200, adjust=False).mean()
-    df15['vol_ma_20']    = df15['volume'].rolling(20).mean()
-    df15['vol_ratio_20'] = df15['volume'] / df15['vol_ma_20']
-
-    # Time features
-    df15['minute']    = df15.index.minute
-    df15['hour']      = df15.index.hour
-    df15['dayofweek'] = df15.index.dayofweek
-
-    df15 = df15.dropna()
-    return df15
-
-def rf_model_validation(symbol: str, threshold: float = 0.6) -> bool:
-    """
-    Validate entry using the Random Forest model.
-    Returns True only if RF predicts the positive/top class with prob >= threshold.
-    """
-    global rf_model, rf_feature_names
-    if rf_model is None:
-        logging.warning(f"[RF] rf_model not loaded; skipping RF validation for {symbol}")
-        return False
-
-    df15 = compute_15m_features_from_1m(symbol)
-    if df15.empty:
-        logging.info(f"[RF] Not enough data to compute RF features for {symbol}")
-        return False
-
-    feat = df15.iloc[[-1]]
-
-    # Align to expected feature names if provided
-    if rf_feature_names:
-        missing = [c for c in rf_feature_names if c not in feat.columns]
-        if missing:
-            logging.warning(f"[RF] Missing features for {symbol}: {missing}")
-            return False
-        X = feat.reindex(columns=rf_feature_names).astype(float).to_numpy()
+            rf_feature_columns = [line.strip() for line in f if line.strip()]
+        logging.info(f"[RF] Loaded feature columns ({len(rf_feature_columns)})")
     else:
-        # Fallback: use numeric columns and match rf_model.n_features_in_
-        numeric_cols = feat.select_dtypes(include=[float, int]).columns.tolist()
-        n_req = getattr(rf_model, 'n_features_in_', None)
-        if n_req is None:
-            X = feat[numeric_cols].astype(float).to_numpy()
-        else:
-            if len(numeric_cols) < n_req:
-                logging.warning(f"[RF] Not enough numeric features for {symbol}: have {len(numeric_cols)}, need {n_req}")
-                return False
-            X = feat[numeric_cols[:n_req]].astype(float).to_numpy()
+        logging.warning(f"[RF] Feature list not found at {RF_FEATURES_PATH}")
+except Exception as e:
+    rf_feature_columns = []
+    logging.exception(f"[RF] Could not load feature list: {e}")
 
+RF_FEATURE_SAVE_DIR = os.path.join(RF_ARTIFACTS_DIR, 'runtime_rf_features')
+RF_SAVE_FEATURES = False
+
+def build_rf_features_15m(symbol: str) -> pd.DataFrame:
+    """Build RF features using 1m candles resampled to 15m."""
     try:
-        proba = rf_model.predict_proba(X)[0]
-        classes = list(rf_model.classes_)
-        pos_label = max(classes)
-        pos_idx = classes.index(pos_label)
-        pos_prob = proba[pos_idx]
-        logging.info(f"[RF] {symbol} RF pos_prob={pos_prob:.3f} (threshold={threshold})")
-        if pos_prob >= threshold:
-            send_telegram(f"[RF] {symbol} RF validation PASSED, pos_prob={pos_prob:.3f}")
-            return True
-        else:
-            logging.info(f"[RF] {symbol} RF validation FAILED: pos_prob={pos_prob:.3f} < {threshold}")
-            return False
+        df1m = fetch_klines_df(symbol, Client.KLINE_INTERVAL_1MINUTE, limit=1000)
+        if df1m.shape[0] < 20:
+            logging.warning(f"[RF] {symbol} insufficient 1m data")
+            return pd.DataFrame()
+        df1m = df1m[['open','high','low','close','volume']].sort_index()
+        df15 = df1m.resample('15min').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+        if df15.empty:
+            return pd.DataFrame()
+
+        df15['return'] = df15['close'].pct_change()
+        df15['return_5min'] = df1m['close'].pct_change(5).resample('15min').last()
+        df15['roll_std_5min'] = df1m['close'].pct_change().rolling(5).std().resample('15min').last()
+        df15['symbol_id'] = LabelEncoder().fit_transform(pd.Series([symbol]*len(df15)))
+        df15['symbol_code'] = symbol
+        df15['open_time_unix'] = df15.index.view(np.int64)//10**9
+
+        feat = df15.iloc[[-1]].copy()
+        if rf_feature_columns:
+            missing = [c for c in rf_feature_columns if c not in feat.columns]
+            if missing:
+                logging.warning(f"[RF] {symbol} missing columns: {missing}")
+                return pd.DataFrame()
+            feat = feat.reindex(columns=rf_feature_columns)
+
+        if feat.isnull().any().any():
+            nan_cols = feat.columns[feat.isnull().any()].tolist()
+            logging.warning(f"[RF] {symbol} NaN columns: {nan_cols}")
+            return pd.DataFrame()
+
+        if RF_SAVE_FEATURES:
+            os.makedirs(RF_FEATURE_SAVE_DIR, exist_ok=True)
+            ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            feat.to_csv(os.path.join(RF_FEATURE_SAVE_DIR, f"{symbol}_{ts}.csv"), index=False)
+
+        return feat
     except Exception as e:
-        logging.exception(f"[RF] Error during RF prediction for {symbol}: {e}")
-        return False
+        logging.exception(f"[RF] {symbol} feature build error: {e}")
+        return pd.DataFrame()
+
+def rf_model_validation(symbol: str) -> tuple[bool, int, np.ndarray]:
+    """Validate entry using RF model. Approves only if class 2 predicted."""
+    if rf_model is None:
+        return (False, None, None)
+    feat = build_rf_features_15m(symbol)
+    if feat.empty:
+        return (False, None, None)
+    try:
+        X = feat.to_numpy(dtype=np.float32)
+        proba = rf_model.predict_proba(X)[0]
+        pred_label = int(rf_model.predict(X)[0])
+        logging.info(f"[RF] {symbol} pred_label={pred_label}, proba={proba.tolist()}")
+        return (pred_label == 2, pred_label, proba)
+    except Exception as e:
+        logging.exception(f"[RF] {symbol} prediction error: {e}")
+        return (False, None, None)
 
 def combined_entry_check(symbol: str) -> bool:
-    """
-    Combined entry check: math rules AND IA model AND RF model validation.
-    Use this where the bot currently requires indicator_signal_long and ia_model_signal_long.
-    """
-    try:
-        math_ok = indicator_signal_long(symbol)
-        ia_ok   = ia_model_signal_long(symbol)
-        rf_ok   = rf_model_validation(symbol) if rf_model is not None else True
-        logging.info(f"[ENTRY CHECK] {symbol} math={math_ok} ia={ia_ok} rf={rf_ok}")
-        return math_ok and ia_ok and rf_ok
-    except Exception as e:
-        logging.exception(f"[ENTRY CHECK] Error checking entry for {symbol}: {e}")
+    """Sequential entry gate with math, IA reg, classifier and RF."""
+    math_ok = indicator_signal_long(symbol)
+    if not math_ok:
+        log_skip('MATH', symbol)
         return False
+    ia_ok = ia_model_signal_long(symbol)
+    if not ia_ok:
+        log_skip('IA_REG', symbol)
+        return False
+    clf_ok = ia_model_classifier_validation(symbol, threshold=CLF_THRESHOLD)
+    if not clf_ok:
+        log_skip('CLF', symbol)
+        return False
+    rf_ok, rf_label, rf_proba = rf_model_validation(symbol)
+    if not rf_ok or rf_label != 2:
+        logging.info(f"[ENTRY] RF blocked: label={rf_label}")
+        log_skip(f'RF label={rf_label}', symbol)
+        return False
+    logging.info(f"[ENTRY APPROVED] MATH+IA_REG+CLF+RF(2) {symbol}")
+    send_telegram(f"[ENTRY APPROVED] MATH+IA_REG+CLF+RF(2) {symbol}")
+    return True
 
 # ─── ENTRY SIGNAL FUNCTION ─────────────────────────────────────────────────────
 
@@ -604,7 +610,7 @@ def ia_model_signal_long(symbol: str) -> bool:
     Gera sinal de entrada LONG baseado na previsão de retorno do regressor XGBoost.
     Só retorna True se:
       1) Replique o pipeline de features de 1m → 15m exatamente como no treino.
-      2) Prever retorno com xgb_reg e for ≥ 0.5% (0.005).
+      2) Prever retorno com xgb_reg e for ≥ 1% (0.01).
     """
     # 1) Busca 3000 candles de 1m e resample para 15m
     df1m = fetch_klines_df(symbol, Client.KLINE_INTERVAL_1MINUTE, limit=3000)
@@ -728,14 +734,12 @@ def ia_model_signal_long(symbol: str) -> bool:
     # 5) Escala e prevê com o regressor
     Xs = scaler.transform(X_feat)
     pred_return = float(xgb_reg.predict(DMatrix(Xs))[0])
-    print(f"[IA_MODEL] {symbol} pred_return={pred_return:.6f}")
     logging.info(f"[IA_MODEL] {symbol} pred_return={pred_return:.6f}")
     # Record prediction for later evaluation
     bar_time = feat.index[-1]  # pd.Timestamp of the bar used for prediction
     record_prediction(symbol, bar_time, pred_return)
-    if pred_return < 0.01:
-        print(f"[IA_MODEL] {symbol} SKIP ENTRY: pred_return={pred_return:.6f} < 0.005")
-        logging.info(f"[IA_MODEL] {symbol} SKIP ENTRY: pred_return={pred_return:.6f} < 0.005")
+    if pred_return < IA_REG_THRESHOLD:
+        logging.info(f"[IA_MODEL] {symbol} SKIP ENTRY: pred_return={pred_return:.6f} < {IA_REG_THRESHOLD}")
         return False
     # Envia mensagem no Telegram quando IA retornar True
     send_telegram(f"[IA_MODEL] {symbol} IA-model TRUE! pred_return={pred_return:.6f}")
@@ -1007,13 +1011,6 @@ def main_loop():
                         logging.info(f"[{symbol}] SKIP: last 1h candle older than 2 days ({df1h.index[-1]})")
                         continue
 
-                    # Compute indicators
-                    df15 = compute_15m_indicators(df15)
-                    macd, macd_signal = compute_1h_macd(df1h)
-                    bar15 = df15.iloc[-1]
-                    bar1h = df1h.iloc[-1]
-                    price = bar15['close']
-
                     # Update equity_high & dynamic risk:
                     if current_equity <= 0:
                         trade_risk = BASE_RISK
@@ -1030,47 +1027,12 @@ def main_loop():
 
                     state = positions.get(symbol)
 
-                    # ——— ENTRY LOGIC ———
                     # ─── ENTRY LOGIC ───
                     if state is None:
-                        # Avaliação flexível das condições matemáticas
-                        cond_ema        = bar15['ema50'] > bar15['ema200']
-                        cond_macd       = macd.iloc[-1] > macd_signal.iloc[-1]
-                        cond_1h         = bar1h['close'] > bar1h['open']
-                        cond_ema_trend  = df15['ema50'].iloc[-3:-1].is_monotonic_increasing if df15.shape[0] >= 3 else False
-                        cond_vol        = bar15['volume'] >= 0.8 * bar15['vol_sma']
-                        cond_price      = price > bar15['ema9']
-
-                        math_signals = [cond_ema, cond_macd, cond_1h, cond_ema_trend, cond_vol, cond_price]
-                        math_score   = sum(math_signals)
-                        MIN_MATH     = 2  # exija 4 de 6 sinais ativos
-
-                        # Log math signals detalhadamente
-                        logging.info(f"[{symbol}] math_signals: EMA50>EMA200={cond_ema}, MACD>{macd_signal.iloc[-1]:.4f}={cond_macd}, 1h_bull={cond_1h}, ema_trend={cond_ema_trend}, vol_ok={cond_vol}, price>ema9={cond_price}, math_score={math_score}")
-                        if math_score < MIN_MATH:
-                            logging.info(f"[{symbol}] SKIP ENTRY: math_score={math_score} < MIN_MATH={MIN_MATH}")
+                        if not combined_entry_check(symbol):
                             continue
 
-                        # Só perguntamos ao IA se a parte matemática passou
-                        ia_long = ia_model_signal_long(symbol)
-                        if not ia_long:
-                            logging.info(f"[{symbol} @ {bar15.name}] SKIP ENTRY: IA-model retornou False")
-                            continue
-
-                        # Nova camada: validação pelo classificador
-                        proba = None
-                        try:
-                            proba = ia_model_classifier_validation(symbol, threshold=0.69)
-                        except Exception as e:
-                            logging.error(f"[{symbol}] Classifier validation exception: {e}")
-                        logging.info(f"[{symbol}] Classifier proba result: {proba}")
-                        if not proba:
-                            logging.info(f"[{symbol} @ {bar15.name}] SKIP ENTRY: Classifier validation reprovada")
-                            continue
-
-                        # … aqui segue a LÓGICA DE EXECUÇÃO DE ORDEM …
-
-                        # 3) Se chegamos aqui, Math e IA concordam → efetuar BUY
+                        price = float(client.get_symbol_ticker(symbol=symbol)["price"])
                         entry_price = price
                         sl_price    = entry_price * (1 - SL_PCT_LONG)
                         tp_price    = entry_price * (1 + TP_PCT)
@@ -1097,7 +1059,7 @@ def main_loop():
 
                         min_trade = MIN_TRADE_BY_PAIR.get(symbol, MIN_USDC_TRADE)
                         if cost < min_trade:
-                            logging.info(f"[{symbol} @ {bar15.name}] SKIP ENTRY: custo {cost:.2f} < mínimo {min_trade:.2f}")
+                            logging.info(f"[{symbol}] SKIP ENTRY: cost {cost:.2f} < minimum {min_trade:.2f}")
                             continue
 
                         # Efetivar ordem de compra
@@ -1106,7 +1068,7 @@ def main_loop():
                             fills = order.get('fills', [])
                             qty_filled = sum(float(fill["qty"]) for fill in fills)
                             if qty_filled <= 0:
-                                logging.error(f"[{symbol} @ {bar15.name}] ORDER ERROR: nenhuma quantidade preenchida")
+                                logging.error(f"[{symbol}] ORDER ERROR: nenhuma quantidade preenchida")
                                 continue
                             avg_price = (
                                 sum(float(fill["price"]) * float(fill["qty"]) for fill in fills) / qty_filled
@@ -1125,16 +1087,16 @@ def main_loop():
                                 "partial_taken": False
                             }
                             position_times[symbol] = datetime.utcnow()
-                            register_trade("BUY", symbol, qty_filled, avg_price, "Math+IA Signal")
+                            register_trade("BUY", symbol, qty_filled, avg_price, "MATH+IA_REG+CLF+RF(2)")
                             send_telegram(f"🟢 BUY {symbol} qty={qty_filled:.6f} @ {avg_price:.4f}")
                             save_state()
 
-                            logging.info(f"[{symbol} @ {bar15.name}] ENTRY EXECUTED: qty={qty_filled:.6f} @ price={avg_price:.4f}")
+                            logging.info(f"[{symbol}] ENTRY EXECUTED: qty={qty_filled:.6f} @ price={avg_price:.4f}")
 
                         except BinanceAPIException as e:
-                            logging.error(f"[{symbol} @ {bar15.name}] ORDER ERROR BUY: {e}")
+                            logging.error(f"[{symbol}] ORDER ERROR BUY: {e}")
                         except Exception as e:
-                            logging.error(f"[{symbol} @ {bar15.name}] ORDER ERROR BUY (outro): {e}")
+                            logging.error(f"[{symbol}] ORDER ERROR BUY (other): {e}")
                             traceback.print_exc()
 
 
