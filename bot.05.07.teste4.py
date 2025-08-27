@@ -38,9 +38,11 @@ from catboost import CatBoostClassifier
 from imblearn.over_sampling import SMOTE
 from scipy.stats import pearsonr
 
+
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 import skops.io as sio
+
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
 
@@ -102,6 +104,18 @@ IA_REG_THRESHOLD = 0.01
 # Skip logging
 SKIP_LOG_FILE = 'bot_skip_log.csv'
 
+# Random Forest artifacts
+RF_ARTIFACTS_DIR = r"C:\Users\CES\Dropbox\Coisas\Coisas do PC\4\6.01"
+RF_SKOPS_PATH    = os.path.join(RF_ARTIFACTS_DIR, 'rf_model.skops')
+RF_FEATURES_PATH = os.path.join(RF_ARTIFACTS_DIR, 'rf_feature_columns.txt')
+
+# Thresholds
+CLF_THRESHOLD   = 0.69
+IA_REG_THRESHOLD = 0.01
+
+# Skip logging
+SKIP_LOG_FILE = 'bot_skip_log.csv'
+
 # ─── LOGGING SETUP ──────────────────────────────────────────────────────────────
 
 def setup_logging():
@@ -117,11 +131,13 @@ def setup_logging():
 
 # Utility: log trades to CSV
 def register_trade(tipo, symbol, qty, price, reason):
+
     header = ['timestamp','type','symbol','qty','price','reason']
     newrow = [
         datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         tipo, symbol, f"{qty:.6f}", f"{price:.4f}", reason
     ]
+
     write_header = not os.path.exists(LOG_FILE)
     with open(LOG_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
@@ -145,6 +161,21 @@ def log_skip(layer: str, symbol: str, info: str = ""):
     send_telegram(msg)
     header = ['timestamp', 'layer', 'symbol', 'info']
     newrow = [datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), layer, symbol, info]
+    write_header = not os.path.exists(SKIP_LOG_FILE)
+    with open(SKIP_LOG_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(header)
+        writer.writerow(newrow)
+
+def log_skip(layer: str, symbol: str, info: str = ""):
+    """Register skip events to CSV and Telegram."""
+    msg = f"[SKIP][{layer}] {symbol} {info}".strip()
+    logging.info(msg)
+    send_telegram(msg)
+    header = ['timestamp', 'layer', 'symbol', 'info']
+    newrow = [datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), layer, symbol, info]
+
     write_header = not os.path.exists(SKIP_LOG_FILE)
     with open(SKIP_LOG_FILE, 'a', newline='') as f:
         writer = csv.writer(f)
@@ -398,6 +429,7 @@ stacked_clf: CalibratedClassifierCV = joblib.load(CLF_MODEL_PATH)
 
 logging.info("IA models loaded successfully.")
 
+
 # --- Random Forest model (SKOPS) ---
 rf_model = None
 rf_feature_columns: list[str] = []
@@ -509,6 +541,7 @@ def combined_entry_check(symbol: str) -> bool:
 
 # ─── ENTRY SIGNAL FUNCTION ─────────────────────────────────────────────────────
 
+
 def indicator_signal_long(symbol: str) -> bool:
     """
     Returns True if at least three of the following five conditions fire a LONG
@@ -614,6 +647,7 @@ def ia_model_signal_long(symbol: str) -> bool:
     Só retorna True se:
       1) Replique o pipeline de features de 1m → 15m exatamente como no treino.
       2) Prever retorno com xgb_reg e for ≥ 1% (0.01).
+
     """
     # 1) Busca 3000 candles de 1m e resample para 15m
     df1m = fetch_klines_df(symbol, Client.KLINE_INTERVAL_1MINUTE, limit=3000)
@@ -736,6 +770,7 @@ def ia_model_signal_long(symbol: str) -> bool:
         return False
     # 5) Escala e prevê com o regressor
     Xs = scaler.transform(X_feat)
+
     pred_return = float(xgb_reg.predict(DMatrix(Xs))[0])
     logging.info(f"[IA_MODEL] {symbol} pred_return={pred_return:.6f}")
     # Record prediction for later evaluation
@@ -747,6 +782,7 @@ def ia_model_signal_long(symbol: str) -> bool:
     # Envia mensagem no Telegram quando IA retornar True
     send_telegram(f"[IA_MODEL] {symbol} IA-model TRUE! pred_return={pred_return:.6f}")
     return True
+
 
 # Lista de features exata usada pelo classificador (MUST match scaler)
 
@@ -954,6 +990,7 @@ def sync_positions_with_binance():
                     # Create an “imported” position skeleton
                     entry_price = float(client.get_symbol_ticker(symbol=symbol)["price"])
                     qty         = float(free_qty)
+
                     positions[symbol] = {
                         "side": "long",
                         "entry_price": entry_price,
@@ -968,6 +1005,7 @@ def sync_positions_with_binance():
                     position_times[symbol] = datetime.now(timezone.utc)
                     logging.info(f"[SYNC POSITION] {symbol} imported with qty={qty:.6f} @ {entry_price:.4f}")
                     save_state()
+
             else:
                 if positions.get(symbol) is not None:
                     positions[symbol] = None
@@ -1014,12 +1052,14 @@ def main_loop():
                         logging.info(f"[{symbol}] SKIP: last 1h candle older than 2 days ({df1h.index[-1]})")
                         continue
 
+
                     # Update equity_high & dynamic risk:
                     if current_equity <= 0:
                         trade_risk = BASE_RISK
                     else:
                         drawdown = (current_equity / equity_high) - 1.0
                         if drawdown < -DD_STOP_PCT:
+
                             trade_risk = 0.005
                         elif current_equity > INITIAL_CAPITAL * 1.5:
                             trade_risk = 0.005
@@ -1029,6 +1069,7 @@ def main_loop():
                             trade_risk = BASE_RISK
 
                     state = positions.get(symbol)
+
 
                     # ─── ENTRY LOGIC ───
                     if state is None:
@@ -1040,6 +1081,7 @@ def main_loop():
                         sl_price    = entry_price * (1 - SL_PCT_LONG)
                         tp_price    = entry_price * (1 + TP_PCT)
                         be_trigger  = entry_price * (1 + BE_PCT)
+
 
                         # Cálculo de posição baseado em risco
                         if current_equity <= 0:
@@ -1059,6 +1101,7 @@ def main_loop():
                         if cost > max_cost:
                             cost = max_cost
                             position_size = cost / entry_price
+
 
                         min_trade = MIN_TRADE_BY_PAIR.get(symbol, MIN_USDC_TRADE)
                         if cost < min_trade:
