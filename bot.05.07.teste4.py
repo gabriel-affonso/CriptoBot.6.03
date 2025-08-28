@@ -116,6 +116,18 @@ IA_REG_THRESHOLD = 0.01
 # Skip logging
 SKIP_LOG_FILE = 'bot_skip_log.csv'
 
+# Random Forest artifacts
+RF_ARTIFACTS_DIR = r"C:\Users\CES\Dropbox\Coisas\Coisas do PC\4\6.01"
+RF_SKOPS_PATH    = os.path.join(RF_ARTIFACTS_DIR, 'rf_model.skops')
+RF_FEATURES_PATH = os.path.join(RF_ARTIFACTS_DIR, 'rf_feature_columns.txt')
+
+# Thresholds
+CLF_THRESHOLD   = 0.69
+IA_REG_THRESHOLD = 0.01
+
+# Skip logging
+SKIP_LOG_FILE = 'bot_skip_log.csv'
+
 # ─── LOGGING SETUP ──────────────────────────────────────────────────────────────
 
 def setup_logging():
@@ -153,6 +165,20 @@ def send_telegram(msg):
         requests.get(url, params={'chat_id': TELEGRAM_CHAT_ID, 'text': msg}, timeout=5)
     except Exception:
         pass
+
+def log_skip(layer: str, symbol: str, info: str = ""):
+    """Register skip events to CSV and Telegram."""
+    msg = f"[SKIP][{layer}] {symbol} {info}".strip()
+    logging.info(msg)
+    send_telegram(msg)
+    header = ['timestamp', 'layer', 'symbol', 'info']
+    newrow = [datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), layer, symbol, info]
+    write_header = not os.path.exists(SKIP_LOG_FILE)
+    with open(SKIP_LOG_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(header)
+        writer.writerow(newrow)
 
 def log_skip(layer: str, symbol: str, info: str = ""):
     """Register skip events to CSV and Telegram."""
@@ -429,7 +455,6 @@ stacked_clf: CalibratedClassifierCV = joblib.load(CLF_MODEL_PATH)
 
 logging.info("IA models loaded successfully.")
 
-
 # --- Random Forest model (SKOPS) ---
 rf_model = None
 rf_feature_columns: list[str] = []
@@ -457,26 +482,93 @@ except Exception as e:
 RF_FEATURE_SAVE_DIR = os.path.join(RF_ARTIFACTS_DIR, 'runtime_rf_features')
 RF_SAVE_FEATURES = False
 
+
 def build_rf_features_15m(symbol: str) -> pd.DataFrame:
-    """Build RF features using 1m candles resampled to 15m."""
+    """Build RF feature row from 1m candles resampled to 15m."""
     try:
-        df1m = fetch_klines_df(symbol, Client.KLINE_INTERVAL_1MINUTE, limit=1000)
-        if df1m.shape[0] < 20:
+        df1m = fetch_klines_df(symbol, Client.KLINE_INTERVAL_1MINUTE, limit=2000)
+        if df1m.shape[0] < 60:
             logging.warning(f"[RF] {symbol} insufficient 1m data")
             return pd.DataFrame()
-        df1m = df1m[['open','high','low','close','volume']].sort_index()
-        df15 = df1m.resample('15min').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+        df1m = df1m[['open', 'high', 'low', 'close', 'volume']].sort_index()
+
+        df15 = df1m.resample('15min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
         if df15.empty:
             return pd.DataFrame()
 
-        df15['return'] = df15['close'].pct_change()
-        df15['return_5min'] = df1m['close'].pct_change(5).resample('15min').last()
-        df15['roll_std_5min'] = df1m['close'].pct_change().rolling(5).std().resample('15min').last()
-        df15['symbol_id'] = LabelEncoder().fit_transform(pd.Series([symbol]*len(df15)))
-        df15['symbol_code'] = symbol
-        df15['open_time_unix'] = df15.index.view(np.int64)//10**9
+        df15['return']       = df15['close'].pct_change()
+        df15['price_change'] = df15['close'] - df15['open']
+        df15['volatility']   = df15['return'].rolling(14).std()
+        df15['direction']    = np.sign(df15['return']).fillna(0)
+
+        df15['sma_20']  = df15['close'].rolling(20).mean()
+        df15['ema_50']  = df15['close'].ewm(span=50, adjust=False).mean()
+
+        from ta.trend      import ADXIndicator
+        from ta.momentum   import RSIIndicator, StochasticOscillator, TSIIndicator
+        from ta.volatility import BollingerBands
+
+        df15['adx_14']   = ADXIndicator(df15['high'], df15['low'], df15['close'], window=14).adx()
+        df15['rsi_14']   = RSIIndicator(df15['close'], window=14).rsi()
+        sto              = StochasticOscillator(df15['high'], df15['low'], df15['close'], window=14, smooth_window=3)
+        df15['sto_k']    = sto.stoch()
+        df15['sto_d']    = sto.stoch_signal()
+        df15['macd']     = df15['close'].ewm(span=12, adjust=False).mean() - df15['close'].ewm(span=26, adjust=False).mean()
+        df15['macd_sig'] = df15['macd'].ewm(span=9, adjust=False).mean()
+        df15['roc_10']   = df15['close'].pct_change(10)
+        df15['tsi_25']   = TSIIndicator(df15['close'], window_slow=25, window_fast=13).tsi()
+
+        hl = df15['high'] - df15['low']
+        hc = (df15['high'] - df15['close'].shift()).abs()
+        lc = (df15['low']  - df15['close'].shift()).abs()
+        df15['atr_14']   = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
+        bb               = BollingerBands(df15['close'], window=20, window_dev=2)
+        df15['bb_width']     = bb.bollinger_hband() - bb.bollinger_lband()
+        df15['bb_percent_b'] = bb.bollinger_pband()
+
+        df15['dc_width']     = df15['high'].rolling(20).max() - df15['low'].rolling(20).min()
+        df15['vol_ma_20']    = df15['volume'].rolling(20).mean()
+        df15['vol_ratio_20'] = df15['volume'] / df15['vol_ma_20']
+        df15['obv']          = (np.sign(df15['close'].diff()) * df15['volume']).cumsum()
+        df15['vpt']          = (df15['close'].pct_change() * df15['volume']).cumsum()
+
+        for p in [5, 10, 20, 60]:
+            df15[f'ret_{p}']      = df15['close'].pct_change(p)
+            df15[f'logret_{p}']   = np.log(df15['close'] / df15['close'].shift(p))
+            df15[f'roll_std_{p}'] = df15['return'].rolling(p).std()
+            df15[f'roll_skew_{p}'] = df15['return'].rolling(p).skew()
+
+        df15['minute']            = df15.index.minute
+        df15['hour']              = df15.index.hour
+        df15['dayofweek']         = df15.index.dayofweek
+        df15['dayofmonth']        = df15.index.day
+        df15['month']             = df15.index.month
+        df15['is_month_end']      = df15.index.is_month_end.astype(int)
+        df15['is_month_start']    = df15.index.is_month_start.astype(int)
+        df15['is_quarter_end']    = df15.index.is_quarter_end.astype(int)
+        df15['mins_since_daystart'] = df15.index.hour * 60 + df15.index.minute
+        df15['hour_sin']          = np.sin(2 * np.pi * df15['hour'] / 24)
+        df15['hour_cos']          = np.cos(2 * np.pi * df15['hour'] / 24)
+        df15['dow_sin']           = np.sin(2 * np.pi * df15['dayofweek'] / 7)
+        df15['dow_cos']           = np.cos(2 * np.pi * df15['dayofweek'] / 7)
+
+        df15['symbol_id'] = LabelEncoder().fit_transform(pd.Series([symbol] * len(df15)))
+
+        df15.dropna(inplace=True)
+        if df15.empty:
+            logging.warning(f"[RF] {symbol} feature DataFrame empty after dropna")
+            return pd.DataFrame()
 
         feat = df15.iloc[[-1]].copy()
+        feat['symbol_code'] = symbol
+        feat['open_time_unix'] = int(feat.index[-1].timestamp())
+
         if rf_feature_columns:
             missing = [c for c in rf_feature_columns if c not in feat.columns]
             if missing:
@@ -542,8 +634,10 @@ def combined_entry_check(symbol: str) -> bool:
 # ─── ENTRY SIGNAL FUNCTION ─────────────────────────────────────────────────────
 
 
+
 def indicator_signal_long(symbol: str) -> bool:
     """
+
     Returns True if at least three of the following five conditions fire a LONG
     signal:
       - 15m EMA50 > EMA200 AND 15m MACD > MACD_SIGNAL
@@ -551,6 +645,7 @@ def indicator_signal_long(symbol: str) -> bool:
       - recent 3 bars of EMA50 on 15m are monotonic increasing
       - 15m volume >= 15m vol_sma
       - price > EMA9 > EMA50 on the latest 15m bar
+
     """
     # Fetch last 100 bars of 15m and 1h
     df15 = fetch_klines_df(symbol, Client.KLINE_INTERVAL_15MINUTE, limit=100)
@@ -577,6 +672,7 @@ def indicator_signal_long(symbol: str) -> bool:
         cond3 = ema50_recent.is_monotonic_increasing
     else:
         cond3 = False
+
     # Condition 4: 15m volume >= vol_sma
     cond4 = bar15['volume'] >= bar15['vol_sma']
     # Condition 5: price > EMA9 > EMA50
@@ -585,6 +681,7 @@ def indicator_signal_long(symbol: str) -> bool:
     # Score system: need at least 3 of 5 conditions to pass
     score = sum([cond1, cond2, cond3, cond4, cond5])
     return score >= 3
+
 
 # ─── IA MODEL SIGNAL FUNCTION ──────────────────────────────────────────────────
 
@@ -644,6 +741,7 @@ def evaluate_predictions():
 def ia_model_signal_long(symbol: str) -> bool:
     """
     Gera sinal de entrada LONG baseado na previsão de retorno do regressor XGBoost.
+
     Só retorna True se:
       1) Replique o pipeline de features de 1m → 15m exatamente como no treino.
       2) Prever retorno com xgb_reg e for ≥ 1% (0.01).
@@ -782,6 +880,7 @@ def ia_model_signal_long(symbol: str) -> bool:
     # Envia mensagem no Telegram quando IA retornar True
     send_telegram(f"[IA_MODEL] {symbol} IA-model TRUE! pred_return={pred_return:.6f}")
     return True
+
 
 
 # Lista de features exata usada pelo classificador (MUST match scaler)
@@ -1159,6 +1258,7 @@ def main_loop():
                             continue
                         current_price = Decimal(str(price))
                         rules = get_symbol_rules(symbol)
+
 
                         # 1) Partial exit logic
                         try:
